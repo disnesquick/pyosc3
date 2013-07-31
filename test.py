@@ -1,0 +1,2 @@
+import osc
+osc.unitTests()
