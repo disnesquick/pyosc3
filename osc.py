@@ -409,47 +409,78 @@ class BinaryDecoder:
 				raise (Exception("Message's typetag-string lacks the magic."))
 		return decoded
 
+class SocketSendProxy:
+	def __init__(self, socket, dest=None, destaddr=None):
+		self.sock = socket
+		self.dest = dest
+		self.destaddr = destaddr
+	def __getitem__(self, destaddr):
+		if self.destaddr:
+			raise(Exception("Destination address has already been specified"))
+		else:
+			return SocketSendProxy(self.sock, self.dest, destaddr)
+	def __lshift__(self, thing):
+		if self.destaddr:
+			thing = Message(thing, address=self.destaddr)
+		if self.dest:
+			self.sock.outSocket.sendto(thing.bin, self.dest)
+		else:
+			self.sock.sendall(thing)
+
 class Socket:
 	# set socket buffer sizes (32k)
 	sendBufSize = 4096 * 8
 	recvBufSize = 4096 * 8
-	def __init__(self, outAddress, outPort, inPort=None, parallelMessages = False):
+	def __init__(self, inPort=None, parallelMessages = False, addressFamily = socket.AF_INET):
 		self.prlMsg = parallelMessages
-		self.targets = AddressTree()
 		self.running = False
-		self.connectOutUDP(outAddress, outPort)
-		if inPort == None:
-			inPort = outPort
-		self.connectInUDP(inPort)
-	
-	def __lshift__(self, thing):
-		self.send(thing)
+		self.connectOutUDP(addressFamily)
+		self.outAddresses = set()
+		if inPort != None:
+			self.targets = AddressTree()
+			self.connectInUDP(inPort)
+		else:
+			self.targets = None
 
+	def __lshift__(self, thing):
+		self.sendall(thing)
+	
+	def __call__(self, address, port):
+		return SocketSendProxy(self, dest=(address,port))
+
+	def __getitem__(self, arg):
+		return SocketSendProxy(self, destaddr=arg)
+
+	def __setitem__(self, target, handle):
+		self.addTarget(target, handle)
+	
 	def __del__(self):
 		if self.running:
 			self.close()
-
-	def send(self, thing):
+	
+	def registerDestination(self, address, port):
+		self.outAddresses.add((address, port))
+	
+	def sendall(self, thing):
 		if isinstance(thing, Message):
-			self.outSocket.sendall(thing.bin)
+			for dest in self.outAddresses:
+				self.outSocket.sendto(thing.bin, dest)
 		else:
 			raise(Exception("Invalid thing being sent down the tubes: "+repr(thing)))
 
-	def connectOutUDP(self, outAddress, outPort):
-		if len(outAddress) == 4:
-			addressFamily = socket.AF_INET6
-		else:
-			addressFamily = socket.AF_INET
+	def connectOutUDP(self, addressFamily):
 		self.outSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
 		self.outSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sendBufSize)
-		self.outSocket.connect((outAddress,outPort))
-		self.fd = self.outSocket.fileno()
-		
+		#self.fd = self.outSocket.fileno()    -- Not sure what this was for...
+	
 	def getOutAddress(self):
 		return self.socket.getpeername()
 
 	def addTarget(self, target, handle):
-		self.targets[target] = handle
+		if self.targets:
+			self.targets[target] = handle
+		else:
+			raise(Exception("Socket was not set up as a listening socket"))
 
 	def connectInUDP(self, inPort):
 		addressFamily = socket.AF_INET
@@ -459,13 +490,22 @@ class Socket:
 		self.thread = Thread(target=self.listenThread)
 		self.thread.start()
 	
-	def _handleMessage(self, packet):
+	def logMessageException(self, packet, exception):
+		print(self, packet.address, packet, exception)
+
+	def runMessage(self, handle, args, source):
+		try:
+			handle(self, *args, source=source)
+		except Exception as E:
+			self.logMessageException(args, E)
+
+	def _handleMessage(self, packet, source):
 		if isinstance(packet, RecvBundle):
 			delta = (datetime.datetime.now() - packet.time).total_seconds()
 			if delta > 0:
 				sleep(delta)
 			for i in packet:
-				self.handleMessage(packet)
+				self.handleMessage(i, source)
 		elif isinstance(packet, RecvMessage):
 			handles = self.targets[packet.address]
 			if len(handles) == 0:
@@ -473,33 +513,24 @@ class Socket:
 			else:
 				if self.prlMsg:
 					for handle in handles[1:]:
-						Thread(target=self.runMessage, args = (handle, args)).start()
-					self.runMessage(handles[0], packet)
+						Thread(target=self.runMessage, args = (handle, packet, source)).start()
+					self.runMessage(handles[0], packet, source)
 				else:
 					for handle in handles:
-						self.runMessage(handle, packet)
+						self.runMessage(handle, packet, source)
 				
 
-	def logMessageException(self, packet, exception):
-		print(self, packet.address, packet, exception)
-
-	def runMessage(self, handle, args):
-		try:
-			handle(self, *args)
-		except Exception as E:
-			self.logMessageException(args, E)
-
-	def handleMessage(self, packet):
-		newThread = Thread(target=self._handleMessage, args=(packet,))
+	def handleMessage(self, packet, source):
+		newThread = Thread(target=self._handleMessage, args=(packet,source))
 		newThread.start()
 
 	def listenThread(self):
 		self.running = True
 		while self.running:
 			try:
-				data = self.inSocket.recvfrom(self.recvBufSize)[0]
-				packet = BinaryDecoder(data).decode()
-				self.handleMessage(packet)
+				data = self.inSocket.recvfrom(self.recvBufSize)
+				packet = BinaryDecoder(data[0]).decode()
+				self.handleMessage(packet, data[1])
 			except socket.error:
 				pass
 
@@ -601,11 +632,12 @@ def header(p):
 	print("".join(["*"]*len(p)))
 	print()
 
-def testEcho(server, backAddress, message):
+def testEcho(server, message,source):
 	message = "ECHO: "+message
-	server << Message(message, address=backAddress)
+	server << Message(message, address="/print")
 
-def testPrint(server, message):
+def testPrint(server, message, source):
+	print(source)
 	print(message)
 
 def unitTests():
@@ -671,10 +703,11 @@ def unitTests():
 	print(adt["/*/subtest8"])
 
 	header("Test setting up a server")
-	oscServe = Socket("localhost", 9013, 9001)
-	oscServe.addTarget("/echo", testEcho)
-	oscServe.addTarget("/print", testPrint)
-	oscServe << Message(True,address="/group3/bool/b")
+	oscServe = Socket(inPort=None)
+	#oscServe.registerDestination("localhost", 9001)
+	#oscServe["/echo"] = testEcho
+	#oscServe["/print"] = testPrint
+	oscServe("localhost",9001)["/group3/bool/a"]  << True
 	try:
 		while True:
 			pass
