@@ -320,9 +320,6 @@ class BinaryDecoder:
 		self.pos = pos + length
 		return ret
 	
-	def _readArray(self):
-		print(self.data)
-
 	def _readTrue(self):
 		return True
 
@@ -381,9 +378,29 @@ class BinaryDecoder:
 		ret, = struct.unpack(">d", self.data[pos:(pos+8)])
 		self.pos+=8
 		return ret
+		
+
+	table = {"i":_readInt, "h":_readLong, "f":_readFloat, "d":_readDouble, "s":_readString, "b":_readBlob, "d":_readDouble, "t":_readTimeTag, "T":_readTrue, "F":_readFalse}
 	
-	table = {"i":_readInt, "h":_readLong, "f":_readFloat, "d":_readDouble, "s":_readString, "b":_readBlob, "d":_readDouble, "t":_readTimeTag, "T":_readTrue, "F":_readFalse, "[":_readArray}
-	
+	def decodeFromTags(self, tags, inArray=False):
+		ary = []
+		for tag in tags:
+			#Array is a special case
+			if tag == "[":
+				self.decodeFromTags(self, tags, True)
+			elif tag == "]":
+				if inArray:
+					return ary
+				else:
+					raise(Exception("End of array found but was not processing an array"))
+			else:
+				try:
+					result = self.table[tag](self)
+					ary.append(result)
+				except:
+					raise(Exception("Error on tag '%s' at '%s' in '%s' with '%s'"%(tag,printBin(self.data[self.pos:]), printBin(self.data), repr(decoded))))
+		return ary
+
 	def decode(self):
 		address = self._readString()
 		if address.startswith(","):
@@ -403,11 +420,9 @@ class BinaryDecoder:
 			if typetags == "":
 				typetags = self._readString()
 			if typetags.startswith(","):
-				for tag in typetags[1:]:
-					try:
-						decoded.append(self.table[tag](self))
-					except:
-						raise(Exception("Error on tag '%s' at '%s' in '%s' with '%s'"%(tag,printBin(self.data[self.pos:]), printBin(self.data), repr(decoded))))
+				tagiter = iter(typetags[1:])
+				for i in self.decodeFromTags(tagiter):
+					decoded.append(i)
 			else:
 				raise (Exception("Message's typetag-string lacks the magic."))
 		return decoded
@@ -706,7 +721,7 @@ def unitTests():
 	print(adt["/*/subtest8"])
 
 	header("Test setting up a server")
-	oscServe = Socket(inPort=9013)
+	oscServe = Socket(inPort=9000)
 	#oscServe.registerDestination("localhost", 9001)
 	#oscServe["/echo"] = testEcho
 	oscServe["/print"] = testPrint
