@@ -320,6 +320,9 @@ class BinaryDecoder:
 		self.pos = pos + length
 		return ret
 	
+	def _readArray(self):
+		print(self.data)
+
 	def _readTrue(self):
 		return True
 
@@ -379,7 +382,7 @@ class BinaryDecoder:
 		self.pos+=8
 		return ret
 	
-	table = {"i":_readInt, "h":_readLong, "f":_readFloat, "d":_readDouble, "s":_readString, "b":_readBlob, "d":_readDouble, "t":_readTimeTag, "T":_readTrue, "F":_readFalse}
+	table = {"i":_readInt, "h":_readLong, "f":_readFloat, "d":_readDouble, "s":_readString, "b":_readBlob, "d":_readDouble, "t":_readTimeTag, "T":_readTrue, "F":_readFalse, "[":_readArray}
 	
 	def decode(self):
 		address = self._readString()
@@ -703,7 +706,7 @@ def unitTests():
 	print(adt["/*/subtest8"])
 
 	header("Test setting up a server")
-	oscServe = Socket(inPort=9012)
+	oscServe = Socket(inPort=9013)
 	#oscServe.registerDestination("localhost", 9001)
 	#oscServe["/echo"] = testEcho
 	oscServe["/print"] = testPrint
