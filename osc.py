@@ -703,11 +703,11 @@ def unitTests():
 	print(adt["/*/subtest8"])
 
 	header("Test setting up a server")
-	oscServe = Socket(inPort=None)
+	oscServe = Socket(inPort=9012)
 	#oscServe.registerDestination("localhost", 9001)
 	#oscServe["/echo"] = testEcho
-	#oscServe["/print"] = testPrint
-	oscServe("localhost",9001)["/group3/bool/a"]  << True
+	oscServe["/print"] = testPrint
+	oscServe("localhost",9013)["/group3/bool/a"]  << True
 	try:
 		while True:
 			pass
