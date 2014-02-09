@@ -67,6 +67,8 @@ class String(Atom):
 
 
 class Boolean(Atom):
+	""" A boolean value, this will be encoded as a type-tag only
+	"""
 	def __init__(self, inThing):
 		self.val = inThing
 		if inThing:
@@ -138,12 +140,23 @@ class TimeTag(Atom):
 	
 	def __repr__(self):
 		return "osc"+self.__class__.__name__+"("+str(self.val)+")"
+
+class Array(Atom):
+	def __init__(self, inThing):
+		self.val = [i if isinstance(i,Atom) else Atom(i) for i in inThing]
+		self.tag = "[%s]"%"".join([i.tag for i in self.val])
+		self.bin = self.OSCEncode()
+	
+	def OSCEncode(self):
+		return b"".join([i.bin for i in self.val])
+
 Atom.announce(String, str)
 Atom.announce(Blob, bytes)
 Atom.announce(Boolean, bool)	#Bool must go before int because of subclass issues
-Atom.announce(Float, float)
-Atom.announce(Double)
+Atom.announce(Float)
+Atom.announce(Double, float)
 Atom.announce(Int, int)
+Atom.announce(Array, list)
 Atom.announce(TimeTag, datetime.datetime)
 
 #TODO: Cache the binary of the message
@@ -282,10 +295,14 @@ class Bundle(Message):
 class RecvBundle(list):
 	def __init__(self, time):
 		self.time = time
+	def __repr__(self):
+		return "bundle:%s"%super().__repr__()
 
 class RecvMessage(list):
 	def __init__(self, address):
 		self.address = address
+	def __repr__(self):
+		return "message:%s"%super().__repr__()
 
 class BinaryDecoder:
 	def __init__(self, binary, pos = 0):
@@ -387,7 +404,7 @@ class BinaryDecoder:
 		for tag in tags:
 			#Array is a special case
 			if tag == "[":
-				self.decodeFromTags(self, tags, True)
+				ary.append(self.decodeFromTags(tags, True))
 			elif tag == "]":
 				if inArray:
 					return ary
@@ -395,8 +412,7 @@ class BinaryDecoder:
 					raise(Exception("End of array found but was not processing an array"))
 			else:
 				try:
-					result = self.table[tag](self)
-					ary.append(result)
+					ary.append(self.table[tag](self))
 				except:
 					raise(Exception("Error on tag '%s' at '%s' in '%s' with '%s'"%(tag,printBin(self.data[self.pos:]), printBin(self.data), repr(decoded))))
 		return ary
@@ -439,7 +455,10 @@ class SocketSendProxy:
 			return SocketSendProxy(self.sock, self.dest, destaddr)
 	def __lshift__(self, thing):
 		if self.destaddr:
-			thing = Message(thing, address=self.destaddr)
+			if thing == None:
+				thing = Message(address=self.destaddr)
+			else:
+				thing = Message(thing, address=self.destaddr)
 		if self.dest:
 			self.sock.outSocket.sendto(thing.bin, self.dest)
 		else:
@@ -454,6 +473,7 @@ class Socket:
 		self.running = False
 		self.connectOutUDP(addressFamily)
 		self.outAddresses = set()
+		self.whiteList = []
 		if inPort != None:
 			self.targets = AddressTree()
 			self.connectInUDP(inPort)
@@ -476,6 +496,19 @@ class Socket:
 		if self.running:
 			self.close()
 	
+	def addToWhiteList(self, address):
+		if not ":" in address:
+			address = address+":[0-9]+"
+		self.whiteList.append(re.compile(address+"$"))
+		
+	def isWhiteListed(self, source):
+		if not self.whiteList:
+			return True
+		for wl in self.whiteList:
+			if wl.match("%s:%d"%source):
+				return True
+		return False
+
 	def registerDestination(self, address, port):
 		self.outAddresses.add((address, port))
 	
@@ -513,7 +546,7 @@ class Socket:
 
 	def runMessage(self, handle, args, source):
 		try:
-			handle(self, *args, source=source)
+			handle(*args, source=source)
 		except Exception as E:
 			self.logMessageException(args, E)
 
@@ -537,7 +570,6 @@ class Socket:
 					for handle in handles:
 						self.runMessage(handle, packet, source)
 				
-
 	def handleMessage(self, packet, source):
 		newThread = Thread(target=self._handleMessage, args=(packet,source))
 		newThread.start()
@@ -547,8 +579,11 @@ class Socket:
 		while self.running:
 			try:
 				data = self.inSocket.recvfrom(self.recvBufSize)
-				packet = BinaryDecoder(data[0]).decode()
-				self.handleMessage(packet, data[1])
+				if self.isWhiteListed(data[1]):
+					packet = BinaryDecoder(data[0]).decode()
+					self.handleMessage(packet, data[1])
+				else:
+					print("Invalid attempt to access from %s"%repr(data[1]))
 			except socket.error:
 				pass
 
@@ -666,12 +701,13 @@ def unitTests():
 	print(Long(1))
 	print(Blob(b"asdasd"))
 	print(String("asdasd"))
+	print(Array(["asdasd","mooop"]))
 	print(TimeTag(datetime.datetime.now()))
 
 	header("Test the direct creation of a message")
 	m = Message(address="/")
 	m.append(Float(1.0))
-	m += [Double(1.0), Int(1), Long(1), Blob(b"asdasd"), String("asdasd")]
+	m += [Double(1.0), Int(1), Long(1), Blob(b"asdasd"), String("asdasd"),Array(["asdasd","mooop"])]
 	print(m)
 
 	header("Test the indirect creation of various Atoms")
@@ -686,10 +722,11 @@ def unitTests():
 	header("Test the indirect creation of a bundle")
 	b = Bundle(time=datetime.datetime.now(), address="/unitTest")
 	b.append([1,2,3,4, True])
-	b.append([1.0,"hello"])
+	b.append([1.0,["hello"]])
 	b.append(m)
 	print(b)
 
+	
 	header("Test the binarization of a message")
 	print(m.bin)
 
@@ -721,10 +758,10 @@ def unitTests():
 	print(adt["/*/subtest8"])
 
 	header("Test setting up a server")
-	oscServe = Socket(inPort=9000)
+	oscServe = Socket(inPort=9001)
 	#oscServe.registerDestination("localhost", 9001)
 	#oscServe["/echo"] = testEcho
-	oscServe["/print"] = testPrint
+	#oscServe["/print"] = testPrint
 	oscServe("localhost",9013)["/group3/bool/a"]  << True
 	try:
 		while True:
