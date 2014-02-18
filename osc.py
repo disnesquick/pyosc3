@@ -1,3 +1,7 @@
+"""
+> Open SoundControl for Python 3
+> Copyright (C) 2013 Trevor Hinkley
+"""
 import struct, math, datetime, sys, socket, re, time
 from threading import Thread
 
