@@ -4,6 +4,7 @@
 """
 import struct, math, datetime, sys, socket, re, time
 from threading import Thread
+import types
 
 def printBin(byteString):
 	a = []
@@ -447,154 +448,6 @@ class BinaryDecoder:
 				raise (Exception("Message's typetag-string lacks the magic."))
 		return decoded
 
-class SocketSendProxy:
-	def __init__(self, socket, dest=None, destaddr=None):
-		self.sock = socket
-		self.dest = dest
-		self.destaddr = destaddr
-	def __getitem__(self, destaddr):
-		if self.destaddr:
-			raise(Exception("Destination address has already been specified"))
-		else:
-			return SocketSendProxy(self.sock, self.dest, destaddr)
-	def __lshift__(self, thing):
-		if self.destaddr:
-			if thing == None:
-				thing = Message(address=self.destaddr)
-			else:
-				thing = Message(thing, address=self.destaddr)
-		if self.dest:
-			self.sock.outSocket.sendto(thing.bin, self.dest)
-		else:
-			self.sock.sendall(thing)
-
-class Socket:
-	# set socket buffer sizes (32k)
-	sendBufSize = 4096 * 8
-	recvBufSize = 4096 * 8
-	def __init__(self, inPort=None, parallelMessages = False, addressFamily = socket.AF_INET):
-		self.prlMsg = parallelMessages
-		self.running = False
-		self.connectOutUDP(addressFamily)
-		self.outAddresses = set()
-		self.whiteList = []
-		if inPort != None:
-			self.targets = AddressTree()
-			self.connectInUDP(inPort)
-		else:
-			self.targets = None
-
-	def __lshift__(self, thing):
-		self.sendall(thing)
-	
-	def __call__(self, address, port):
-		return SocketSendProxy(self, dest=(address,port))
-
-	def __getitem__(self, arg):
-		return SocketSendProxy(self, destaddr=arg)
-
-	def __setitem__(self, target, handle):
-		self.addTarget(target, handle)
-	
-	def __del__(self):
-		if self.running:
-			self.close()
-	
-	def addToWhiteList(self, address):
-		if not ":" in address:
-			address = address+":[0-9]+"
-		self.whiteList.append(re.compile(address+"$"))
-		
-	def isWhiteListed(self, source):
-		if not self.whiteList:
-			return True
-		for wl in self.whiteList:
-			if wl.match("%s:%d"%source):
-				return True
-		return False
-
-	def registerDestination(self, address, port):
-		self.outAddresses.add((address, port))
-	
-	def sendall(self, thing):
-		if isinstance(thing, Message):
-			for dest in self.outAddresses:
-				self.outSocket.sendto(thing.bin, dest)
-		else:
-			raise(Exception("Invalid thing being sent down the tubes: "+repr(thing)))
-
-	def connectOutUDP(self, addressFamily):
-		self.outSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
-		self.outSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sendBufSize)
-		#self.fd = self.outSocket.fileno()    -- Not sure what this was for...
-	
-	def getOutAddress(self):
-		return self.socket.getpeername()
-
-	def addTarget(self, target, handle):
-		if self.targets:
-			self.targets[target] = handle
-		else:
-			raise(Exception("Socket was not set up as a listening socket"))
-
-	def connectInUDP(self, inPort):
-		addressFamily = socket.AF_INET
-		self.inSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
-		self.inSocket.settimeout(1)
-		self.inSocket.bind(("",inPort))
-		self.thread = Thread(target=self.listenThread)
-		self.thread.start()
-	
-	def logMessageException(self, packet, exception):
-		print(self, packet.address, packet, exception)
-
-	def runMessage(self, handle, args, source):
-		try:
-			handle(*args, source=source)
-		except Exception as E:
-			self.logMessageException(args, E)
-
-	def _handleMessage(self, packet, source):
-		if isinstance(packet, RecvBundle):
-			delta = (datetime.datetime.now() - packet.time).total_seconds()
-			if delta > 0:
-				sleep(delta)
-			for i in packet:
-				self.handleMessage(i, source)
-		elif isinstance(packet, RecvMessage):
-			handles = self.targets[packet.address]
-			if len(handles) == 0:
-				self.logMessageException(packet, Exception("Message has no targets"))
-			else:
-				if self.prlMsg:
-					for handle in handles[1:]:
-						Thread(target=self.runMessage, args = (handle, packet, source)).start()
-					self.runMessage(handles[0], packet, source)
-				else:
-					for handle in handles:
-						self.runMessage(handle, packet, source)
-				
-	def handleMessage(self, packet, source):
-		newThread = Thread(target=self._handleMessage, args=(packet,source))
-		newThread.start()
-
-	def listenThread(self):
-		self.running = True
-		while self.running:
-			try:
-				data = self.inSocket.recvfrom(self.recvBufSize)
-				if self.isWhiteListed(data[1]):
-					packet = BinaryDecoder(data[0]).decode()
-					self.handleMessage(packet, data[1])
-				else:
-					print("Invalid attempt to access from %s"%repr(data[1]))
-			except socket.error:
-				pass
-
-	def close(self):
-		self.running = False
-		
-
 
 # A translation-table for mapping OSC-address expressions to Python 're' expressions
 OSCtrans = str.maketrans("{,}?","(|).")
@@ -656,6 +509,193 @@ class AddressTree(AddressNode):
 			curNode = foundNode
 		curNode.leaf = value,
 
+
+
+
+class MetaSocket(type):
+	class Exposure:
+		def __init__(self, func, path):
+			self.func = func
+			self.path = path
+	
+	@classmethod
+	def expose(cls, path):
+		def inner(func):
+			return cls.Exposure(func, path)
+		return inner
+	
+	def __new__(cls, name, bases, nameSpace):
+		del nameSpace["expose"]
+		targets = list()
+		for i in nameSpace:
+			e = nameSpace[i]
+			if isinstance(e, MetaSocket.Exposure):
+				targets.append(e)
+				nameSpace[i] = e.func
+		nameSpace["classTargets"] = targets
+		return super().__new__(cls, name, bases, nameSpace)
+
+	def __init__(self, name, bases, nameSpace):
+		targets = AddressTree()
+		for i in nameSpace["classTargets"]:
+			targets[i.path] = i.func
+		self.classTargets = targets
+
+	@classmethod
+	def __prepare__(meta, name, bases):
+		return dict(expose=meta.expose)
+
+
+
+class Socket(metaclass = MetaSocket):
+	# set socket buffer sizes (32k)
+	sendBufSize = 4096 * 8
+	recvBufSize = 4096 * 8
+	def __init__(self, inPort=None, parallelMessages = False, addressFamily = socket.AF_INET):
+		self.prlMsg = parallelMessages
+		self.running = False
+		self.outAddresses = set()
+		self.whiteList = []
+		if inPort != None:
+			self.targets = AddressTree()
+			self.connectInUDP(addressFamily, inPort)
+			self.outSocket = self.inSocket
+		else:
+			self.connectOutUDP(addressFamily)
+			self.targets = None
+			self.inSocket = None
+	
+	def __lshift__(self, thing):
+		self.sendall(thing)
+	
+	def __call__(self, address, port):
+		return SocketSendProxy(self, dest=(address,port))
+	
+	def __getitem__(self, arg):
+		return SocketSendProxy(self, destaddr=arg)
+	
+	def __setitem__(self, target, handle):
+		self.addTarget(target, handle)
+	
+	def __del__(self):
+		if self.running:
+			self.close()
+	
+	def addToWhiteList(self, address):
+		if not ":" in address:
+			address = address+":[0-9]+"
+		self.whiteList.append(re.compile(address+"$"))
+	
+	def isWhiteListed(self, source):
+		if not self.whiteList:
+			return True
+		for wl in self.whiteList:
+			if wl.match("%s:%d"%source):
+				return True
+		return False
+	
+	def registerDestination(self, address, port):
+		self.outAddresses.add((address, port))
+	
+	def sendall(self, thing):
+		if isinstance(thing, Message):
+			for dest in self.outAddresses:
+				self.outSocket.sendto(thing.bin, dest)
+		else:
+			raise(Exception("Invalid thing being sent down the tubes: "+repr(thing)))
+
+	def connectOutUDP(self, addressFamily):
+		self.outSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
+		self.outSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sendBufSize)
+	
+	def getOutAddress(self):
+		return self.socket.getpeername()
+
+	def addTarget(self, target, handle):
+		if self.targets:
+			self.targets[target] = handle
+		else:
+			raise(Exception("Socket was not set up as a listening socket"))
+
+	def connectInUDP(self, addressFamily, inPort):
+		self.inSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
+		self.inSocket.settimeout(1)
+		self.inSocket.bind(("",inPort))
+		self.thread = Thread(target=self.listenThread)
+		self.thread.start()
+	
+	def logMessageException(self, packet, exception):
+		print(self, packet.address, packet, exception)
+
+	def runMessage(self, handle, args, source):
+		try:
+			handle(self, *args, source=source)
+		except Exception as E:
+			self.logMessageException(args, E)
+
+	def _handleMessage(self, packet, source):
+		if isinstance(packet, RecvBundle):
+			delta = (datetime.datetime.now() - packet.time).total_seconds()
+			if delta > 0:
+				sleep(delta)
+			for i in packet:
+				self.handleMessage(i, source)
+		elif isinstance(packet, RecvMessage):
+			handles = self.targets[packet.address] + self.classTargets[packet.address]
+			if len(handles) == 0:
+				self.logMessageException(packet, Exception("Message has no targets"))
+			else:
+				if self.prlMsg:
+					for handle in handles[1:]:
+						Thread(target=self.runMessage, args = (handle, packet, source)).start()
+					self.runMessage(handles[0], packet, source)
+				else:
+					for handle in handles:
+						self.runMessage(handle, packet, source)
+				
+	def handleMessage(self, packet, source):
+		newThread = Thread(target=self._handleMessage, args=(packet,source))
+		newThread.start()
+
+	def listenThread(self):
+		self.running = True
+		while self.running:
+			try:
+				data = self.inSocket.recvfrom(self.recvBufSize)
+				if self.isWhiteListed(data[1]):
+					packet = BinaryDecoder(data[0]).decode()
+					self.handleMessage(packet, data[1])
+				else:
+					print("Invalid attempt to access from %s"%repr(data[1]))
+			except socket.error:
+				pass
+
+	def close(self):
+		self.running = False
+		
+class SocketSendProxy:
+	def __init__(self, socket, dest=None, destaddr=None):
+		self.sock = socket
+		self.dest = dest
+		self.destaddr = destaddr
+	def __getitem__(self, destaddr):
+		if self.destaddr:
+			raise(Exception("Destination address has already been specified"))
+		else:
+			return SocketSendProxy(self.sock, self.dest, destaddr)
+	def __lshift__(self, thing):
+		if self.destaddr:
+			if thing == None:
+				thing = Message(address=self.destaddr)
+			else:
+				thing = Message(thing, address=self.destaddr)
+		if self.dest:
+			self.sock.outSocket.sendto(thing.bin, self.dest)
+		else:
+			self.sock.sendall(thing)
+
+
+
 """
 Dummied out for now...
 class RegexNode:
@@ -681,7 +721,6 @@ class RegexTree:
 				foundNode = RegexNode(curRE)
 			node = foundNode
 """
-
 
 def header(p):
 	print("\n")
