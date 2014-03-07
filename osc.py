@@ -476,6 +476,7 @@ class AddressNode:
 	def __init__(self):
 		self.children = []
 		self.leaf = tuple()
+		self.subs = []
 	def match(self, matchList, pos):
 		if pos == len(matchList):
 			return self.leaf
@@ -484,6 +485,8 @@ class AddressNode:
 		for string, node in self.children:
 			if matcher.match(string):
 				matches += node.match(matchList,pos+1)
+		for sub in self.subs:
+			matches += sub.match(matchList[pos:], 0)
 		return matches
 
 class AddressTree(AddressNode):
@@ -507,12 +510,15 @@ class AddressTree(AddressNode):
 				foundNode = AddressNode()
 				curNode.children.append((curString, foundNode))
 			curNode = foundNode
-		curNode.leaf = value,
+		if isinstance(value, AddressTree) or isinstance(value, Responder):
+			curNode.subs.append(value)
+		else:
+			curNode.leaf = (value,) + curNode.leaf
 
 
 
 
-class MetaSocket(type):
+class MetaResponder(type):
 	class Exposure:
 		def __init__(self, func, path):
 			self.func = func
@@ -529,25 +535,39 @@ class MetaSocket(type):
 		targets = list()
 		for i in nameSpace:
 			e = nameSpace[i]
-			if isinstance(e, MetaSocket.Exposure):
+			if isinstance(e, MetaResponder.Exposure):
 				targets.append(e)
 				nameSpace[i] = e.func
 		nameSpace["classTargets"] = targets
 		return super().__new__(cls, name, bases, nameSpace)
-
+	
 	def __init__(self, name, bases, nameSpace):
 		targets = AddressTree()
 		for i in nameSpace["classTargets"]:
 			targets[i.path] = i.func
 		self.classTargets = targets
-
+	
 	@classmethod
 	def __prepare__(meta, name, bases):
 		return dict(expose=meta.expose)
 
+class Responder(metaclass = MetaResponder):
+	@classmethod
+	def getResponse(cls, address):
+		response = cls.classTargets[address]
+		for sup in cls.__bases__:
+			if isinstance(sup, Responder):
+				response = response + sup.getResponse(address)
+		return response
+	@classmethod
+	def match(cls, matchList, pos):
+		response = cls.classTargets.match(matchList, pos)
+		for sup in cls.__bases__:
+			if isinstance(sup, Responder):
+				response = response + sup.match(matchList, pos)
+		return response
 
-
-class Socket(metaclass = MetaSocket):
+class Socket(Responder):
 	# set socket buffer sizes (32k)
 	sendBufSize = 4096 * 8
 	recvBufSize = 4096 * 8
@@ -564,6 +584,7 @@ class Socket(metaclass = MetaSocket):
 			self.connectOutUDP(addressFamily)
 			self.targets = None
 			self.inSocket = None
+		self.outSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sendBufSize)
 	
 	def __lshift__(self, thing):
 		self.sendall(thing)
@@ -606,7 +627,6 @@ class Socket(metaclass = MetaSocket):
 
 	def connectOutUDP(self, addressFamily):
 		self.outSocket = socket.socket(addressFamily, socket.SOCK_DGRAM)
-		self.outSocket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sendBufSize)
 	
 	def getOutAddress(self):
 		return self.socket.getpeername()
@@ -641,7 +661,7 @@ class Socket(metaclass = MetaSocket):
 			for i in packet:
 				self.handleMessage(i, source)
 		elif isinstance(packet, RecvMessage):
-			handles = self.targets[packet.address] + self.classTargets[packet.address]
+			handles = self.targets[packet.address] + self.getResponse(packet.address)
 			if len(handles) == 0:
 				self.logMessageException(packet, Exception("Message has no targets"))
 			else:
@@ -652,7 +672,7 @@ class Socket(metaclass = MetaSocket):
 				else:
 					for handle in handles:
 						self.runMessage(handle, packet, source)
-				
+	
 	def handleMessage(self, packet, source):
 		newThread = Thread(target=self._handleMessage, args=(packet,source))
 		newThread.start()
